@@ -144,7 +144,7 @@ def build_train_valid_test_datasets(
 
 
 def get_train_valid_test_split_(splits_string, size):
-    """Get dataset splits from comma or '/' separated string list."""
+    """ Get dataset splits from comma or '/' separated string list."""
 
     splits = []
     if splits_string.find(",") != -1:
@@ -269,7 +269,7 @@ def weights_by_num_docs(l: list, alpha=0.3):
     total_n_docs = sum(l)
     unbiased_sample_probs = [i / total_n_docs for i in l]
 
-    probs = [i**alpha for i in unbiased_sample_probs]
+    probs = [i ** alpha for i in unbiased_sample_probs]
 
     # normalize
     total = sum(probs)
@@ -284,6 +284,104 @@ def weights_by_num_docs(l: list, alpha=0.3):
     weights = [i / total for i in weights]
 
     return weights
+
+
+def build_datasets_from_neox_args(neox_args):
+    # Number of train/valid/test samples.
+    train_iters = neox_args.train_iters
+    eval_iters = (train_iters // neox_args.eval_interval + 1) * neox_args.eval_iters
+    test_iters = neox_args.eval_iters
+
+    train_val_test_num_samples = [
+        train_iters * neox_args.train_batch_size,
+        eval_iters * neox_args.train_batch_size,
+        test_iters * neox_args.train_batch_size,
+    ]
+
+    if neox_args.train_data_paths:
+        # when individual train / valid / test data paths are provided
+        # normalize weight values and get num samples for each dataset
+        train_weights, train_num_samples = get_normalized_weights_and_num_samples(
+            neox_args.train_data_weights, train_val_test_num_samples[0]
+        )
+        valid_weights, valid_num_samples = get_normalized_weights_and_num_samples(
+            neox_args.valid_data_weights, train_val_test_num_samples[1]
+        )
+        test_weights, test_num_samples = get_normalized_weights_and_num_samples(
+            neox_args.test_data_weights, train_val_test_num_samples[2]
+        )
+
+        # build individual datasets
+        train_datasets, valid_datasets, test_datasets = build_weighted_datasets(
+            neox_args,
+            train_num_samples,
+            valid_num_samples,
+            test_num_samples,
+            train_weights,
+            valid_weights,
+            test_weights,
+            build_index_mappings=not neox_args.weight_by_num_documents,
+        )
+
+        if neox_args.weight_by_num_documents:
+            # gets the number of documents in each datapath
+            get_num_docs_list = lambda datasets: [
+                dataset.indexed_dataset.sizes.shape[0] for dataset in datasets
+            ]
+            train_num_docs, valid_num_docs, test_num_docs = (
+                get_num_docs_list(train_datasets),
+                get_num_docs_list(valid_datasets),
+                get_num_docs_list(test_datasets),
+            )
+
+            # builds weights according to alpha + the number of docs
+            fn = partial(weights_by_num_docs, alpha=neox_args.weighted_sampler_alpha)
+            train_weights, valid_weights, test_weights = (
+                fn(train_num_docs),
+                fn(valid_num_docs),
+                fn(test_num_docs),
+            )
+            train_weights, train_num_samples = get_normalized_weights_and_num_samples(
+                train_weights, train_val_test_num_samples[0]
+            )
+            valid_weights, valid_num_samples = get_normalized_weights_and_num_samples(
+                valid_weights, train_val_test_num_samples[1]
+            )
+            test_weights, test_num_samples = get_normalized_weights_and_num_samples(
+                test_weights, train_val_test_num_samples[2]
+            )
+
+            # rebuild datasets weighted according to new weights
+            train_datasets, valid_datasets, test_datasets = build_weighted_datasets(
+                neox_args,
+                train_num_samples,
+                valid_num_samples,
+                test_num_samples,
+                train_weights,
+                valid_weights,
+                test_weights,
+            )
+
+        if train_datasets:
+            train_ds = BlendableDataset(train_datasets, train_weights)
+        if valid_datasets:
+            valid_ds = BlendableDataset(valid_datasets, valid_weights)
+        if test_datasets:
+            test_ds = BlendableDataset(test_datasets, test_weights)
+    else:
+        # when just data_path is provided
+        # split dataset into train, valid and test from data_path
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+            data_prefix=neox_args.data_path,
+            use_shared_fs=neox_args.use_shared_fs,
+            data_impl=neox_args.data_impl,
+            splits_string=neox_args.split,
+            train_valid_test_num_samples=train_val_test_num_samples,
+            seq_length=neox_args.seq_length,
+            seed=neox_args.seed,
+            skip_warmup=(not neox_args.mmap_warmup),
+        )
+    return train_ds, valid_ds, test_ds
 
 
 def build_train_valid_test_data_iterators(neox_args):
@@ -305,108 +403,7 @@ def build_train_valid_test_data_iterators(neox_args):
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0 and pipe_load:
-        # Number of train/valid/test samples.
-        train_iters = neox_args.train_iters
-        eval_iters = (train_iters // neox_args.eval_interval + 1) * neox_args.eval_iters
-        test_iters = neox_args.eval_iters
-        train_val_test_num_samples = [
-            train_iters * neox_args.train_batch_size,
-            eval_iters * neox_args.train_batch_size,
-            test_iters * neox_args.train_batch_size,
-        ]
-
-        if neox_args.train_data_paths:
-            # when individual train / valid / test data paths are provided
-            # normalize weight values and get num samples for each dataset
-            train_weights, train_num_samples = get_normalized_weights_and_num_samples(
-                neox_args.train_data_weights, train_val_test_num_samples[0]
-            )
-            valid_weights, valid_num_samples = get_normalized_weights_and_num_samples(
-                neox_args.valid_data_weights, train_val_test_num_samples[1]
-            )
-            test_weights, test_num_samples = get_normalized_weights_and_num_samples(
-                neox_args.test_data_weights, train_val_test_num_samples[2]
-            )
-
-            # build individual datasets
-            train_datasets, valid_datasets, test_datasets = build_weighted_datasets(
-                neox_args,
-                train_num_samples,
-                valid_num_samples,
-                test_num_samples,
-                train_weights,
-                valid_weights,
-                test_weights,
-                build_index_mappings=not neox_args.weight_by_num_documents,
-            )
-
-            if neox_args.weight_by_num_documents:
-
-                # gets the number of documents in each datapath
-                get_num_docs_list = lambda datasets: [
-                    dataset.indexed_dataset.sizes.shape[0] for dataset in datasets
-                ]
-                train_num_docs, valid_num_docs, test_num_docs = (
-                    get_num_docs_list(train_datasets),
-                    get_num_docs_list(valid_datasets),
-                    get_num_docs_list(test_datasets),
-                )
-
-                # builds weights according to alpha + the number of docs
-                fn = partial(
-                    weights_by_num_docs, alpha=neox_args.weighted_sampler_alpha
-                )
-                train_weights, valid_weights, test_weights = (
-                    fn(train_num_docs),
-                    fn(valid_num_docs),
-                    fn(test_num_docs),
-                )
-                (
-                    train_weights,
-                    train_num_samples,
-                ) = get_normalized_weights_and_num_samples(
-                    train_weights, train_val_test_num_samples[0]
-                )
-                (
-                    valid_weights,
-                    valid_num_samples,
-                ) = get_normalized_weights_and_num_samples(
-                    valid_weights, train_val_test_num_samples[1]
-                )
-                test_weights, test_num_samples = get_normalized_weights_and_num_samples(
-                    test_weights, train_val_test_num_samples[2]
-                )
-
-                # rebuild datasets weighted according to new weights
-                train_datasets, valid_datasets, test_datasets = build_weighted_datasets(
-                    neox_args,
-                    train_num_samples,
-                    valid_num_samples,
-                    test_num_samples,
-                    train_weights,
-                    valid_weights,
-                    test_weights,
-                )
-
-            if train_datasets:
-                train_ds = BlendableDataset(train_datasets, train_weights)
-            if valid_datasets:
-                valid_ds = BlendableDataset(valid_datasets, valid_weights)
-            if test_datasets:
-                test_ds = BlendableDataset(test_datasets, test_weights)
-        else:
-            # when just data_path is provided
-            # split dataset into train, valid and test from data_path
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-                data_prefix=neox_args.data_path,
-                use_shared_fs=neox_args.use_shared_fs,
-                data_impl=neox_args.data_impl,
-                splits_string=neox_args.split,
-                train_valid_test_num_samples=train_val_test_num_samples,
-                seq_length=neox_args.seq_length,
-                seed=neox_args.seed,
-                skip_warmup=(not neox_args.mmap_warmup),
-            )
+        train_ds, valid_ds, test_ds = build_datasets_from_neox_args(neox_args)
 
         # Build dataloders.
         train_dataloader = make_data_loader(train_ds, neox_args=neox_args)

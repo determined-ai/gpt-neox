@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import yaml
 import json
+import inspect
 import logging
 import copy
 import torch
@@ -34,8 +35,11 @@ from deepspeed.launcher.runner import DLTS_HOSTFILE
 from megatron.logging import Tee
 from megatron.tokenizer import build_tokenizer
 from megatron.utils import obtain_resource_pool, expand_attention_types
-from .deepspeed_args import NeoXArgsDeepspeedConfig, NeoXArgsDeepspeedRunner
-from .neox_args import (
+from megatron.neox_arguments.deepspeed_args import (
+    NeoXArgsDeepspeedConfig,
+    NeoXArgsDeepspeedRunner,
+)
+from megatron.neox_arguments.neox_args import (
     NeoXArgsModel,
     NeoXArgsTokenizer,
     NeoXArgsTraining,
@@ -346,6 +350,10 @@ class NeoXArgs(*BASE_CLASSES):
         assert os.path.exists(
             args_parsed.user_script
         ), f"User script could not be found: {args_parsed.user_script}"
+        return cls.process_parsed_deepy_args(args_parsed)
+
+    @classmethod
+    def process_parsed_deepy_args(cls, args_parsed, overwrite_values=None):
 
         # load config files
         conf_files = args_parsed.conf_file
@@ -359,16 +367,20 @@ class NeoXArgs(*BASE_CLASSES):
         ]
 
         # determine overwrite values
-        overwrite_values = dict()
-        for k, v in vars(args_parsed).items():
-            if k == "autotuning" and v is not None:
-                overwrite_values["autotuning_run"] = v
-            elif k not in ["conf_dir", "conf_file"] and v is not None:
-                overwrite_values[k] = v
+        possible_args = inspect.getfullargspec(cls)[0]
+        full_overwrite_values = dict()
+        for k, v in args_parsed.items():
+            if (
+                k not in ["conf_dir", "conf_file"]
+                and k in possible_args
+                and v is not None
+            ):
+                full_overwrite_values[k] = v
+        full_overwrite_values.update(overwrite_values)
 
         # load args
         neox_args = cls.from_ymls(
-            paths_to_yml_files=conf_files, overwrite_values=overwrite_values
+            paths_to_yml_files=conf_files, overwrite_values=full_overwrite_values
         )
 
         if neox_args.use_wandb:
