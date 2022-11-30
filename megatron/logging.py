@@ -99,10 +99,12 @@ def training_log(
     model,
     optimizer,
     noise_scale_logger,
+    return_metrics=False,
 ):
     """Log training information such as losses, timing, etc."""
 
     # Update losses.
+    log_interval_metrics = None
     skipped_iters_key = "skipped iterations"
     total_loss_dict[skipped_iters_key] = (
         total_loss_dict.get(skipped_iters_key, 0) + skipped_iter
@@ -156,7 +158,7 @@ def training_log(
             ):
                 timer_values = model.timer_values
                 # deepspeed already logs to tensorboard / prints values, so just log to wandb
-                if neox_args.use_wandb and torch.distributed.get_rank() == 0:
+                if torch.distributed.get_rank() == 0:
                     for key in timer_values:
                         tb_wandb_log(
                             f"timers/{key}",
@@ -339,6 +341,19 @@ def training_log(
 
         timers.log(timers_to_log, normalizer=neox_args.log_interval)
 
+        if return_metrics:
+            log_interval_metrics = {
+                "learning_rate": learning_rate,
+                "loss_scale": loss_scale,
+                "samples_per_sec": samples_per_sec,
+                "flops_per_sec_per_gpu": flops_per_s_per_gpu,
+                "num_skipped": total_loss_dict[skipped_iters_key],
+                "num_nans": total_loss_dict[got_nan_key],
+            }
+        total_loss_dict[skipped_iters_key] = 0
+        total_loss_dict[got_nan_key] = 0
+    if return_metrics:
+        return report_memory_flag, log_interval_metrics
     return report_memory_flag
 
 
