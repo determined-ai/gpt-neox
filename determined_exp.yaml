@@ -1,0 +1,25 @@
+name: gpt-neox test
+workspace: gpt-neox
+project: gpt-neox
+environment:
+  force_pull_image: true
+  image:
+    cuda: coreystatendet/gpt-neox-test
+  environment_variables:
+    - NCCL_DEBUG=INFO
+    - NCCL_SOCKET_IFNAME=ens,eth,ib
+    - OMP_NUM_THREADS=1    
+resources:
+  slots_per_trial: 2
+max_restarts: 0
+hyperparameters:
+  config_files: ["configs/19M.yml", "configs/determined_cluster.yml"]
+  shared_fs_path: "/run/determined/workdir/shared_fs"
+  overwrite_values:
+    eval_iters: 20
+searcher:
+  name: single
+  metric: validation/lm_loss_ppl
+  max_length: 20
+  smaller_is_better: true
+entrypoint: python3 -m determined.launch.deepspeed python determined_train.py

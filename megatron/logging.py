@@ -84,10 +84,7 @@ def get_flops(neox_args, model, iter_time_s) -> float:
     ff = model.total_params * 6
     attn = neox_args.seq_length * neox_args.hidden_size * neox_args.num_layers * 60
     flops = (
-        neox_args.train_batch_size
-        * neox_args.seq_length
-        * (ff + attn)
-        / (iter_time_s * world_size)
+        neox_args.train_batch_size * neox_args.seq_length * (ff + attn) / (iter_time_s * world_size)
     )
     return flops
 
@@ -105,14 +102,15 @@ def training_log(
     model,
     optimizer,
     noise_scale_logger,
+    core_context,
 ):
+    global DETERMINED_ACCUMULATED_LOGS
+    DETERMINED_ACCUMULATED_LOGS.clear()
     """Log training information such as losses, timing, etc."""
 
     # Update losses.
     skipped_iters_key = "skipped iterations"
-    total_loss_dict[skipped_iters_key] = (
-        total_loss_dict.get(skipped_iters_key, 0) + skipped_iter
-    )
+    total_loss_dict[skipped_iters_key] = total_loss_dict.get(skipped_iters_key, 0) + skipped_iter
     got_nan_key = "got nan"
 
     got_nan = False
@@ -148,18 +146,13 @@ def training_log(
         if normalizer == 0:
             normalizer = neox_args.log_interval
         if torch.distributed.get_rank() == 0:
-            timers.write(
-                names=timers_to_log, iteration=iteration, normalizer=normalizer
-            )
+            timers.write(names=timers_to_log, iteration=iteration, normalizer=normalizer)
     else:
         # with pipeline parallel, the megatron timers are overridden by the deepspeed ones.
         # Try to grab timer values from model engine. Only recently added to deeperspeed, so check that the engine
         # has that attribute first
         if hasattr(model, "timer_values") and model.timer_values is not None:
-            if (
-                model.wall_clock_breakdown()
-                and model.global_steps % model.steps_per_print() == 0
-            ):
+            if model.wall_clock_breakdown() and model.global_steps % model.steps_per_print() == 0:
                 timer_values = model.timer_values
                 # deepspeed already logs to tensorboard / prints values, so just log to wandb
                 if neox_args.use_wandb and torch.distributed.get_rank() == 0:
@@ -223,20 +216,13 @@ def training_log(
                     )
 
     # (optional) Log grad/param norms to wandb / tb every step
-    if (
-        neox_args.log_grad_pct_zeros
-        or neox_args.log_grad_norm
-        or neox_args.log_param_norm
-    ):
+    if neox_args.log_grad_pct_zeros or neox_args.log_grad_norm or neox_args.log_param_norm:
         if neox_args.log_grad_pct_zeros or neox_args.log_grad_norm:
             model.store_gradients = True  # start storing gradients
 
         for i, (name, param) in enumerate(model.module.named_parameters()):
             if neox_args.log_grad_pct_zeros:
-                if (
-                    hasattr(model, "stored_gradients")
-                    and model.stored_gradients is not None
-                ):
+                if hasattr(model, "stored_gradients") and model.stored_gradients is not None:
                     grad = model.stored_gradients[i]
                     if grad is not None:
                         tb_wandb_log(
@@ -248,10 +234,7 @@ def training_log(
                             all_ranks=True,
                         )
             if neox_args.log_grad_norm:
-                if (
-                    hasattr(model, "stored_gradients")
-                    and model.stored_gradients is not None
-                ):
+                if hasattr(model, "stored_gradients") and model.stored_gradients is not None:
                     grad = model.stored_gradients[i]
                     if grad is not None:
                         tb_wandb_log(
@@ -292,16 +275,12 @@ def training_log(
             use_wandb=neox_args.use_wandb,
             tensorboard_writer=neox_args.tensorboard_writer,
         )
-        log_string += " iteration {:8d}/{:8d} |".format(
-            iteration, neox_args.train_iters
-        )
+        log_string += " iteration {:8d}/{:8d} |".format(iteration, neox_args.train_iters)
         log_string += " elapsed time per iteration (ms): {:.1f} |".format(
             elapsed_time * 1000.0 / neox_args.log_interval
         )
         log_string += " learning rate: {:.3E} |".format(learning_rate)
-        num_iterations = max(
-            1, neox_args.log_interval - total_loss_dict[skipped_iters_key]
-        )
+        num_iterations = max(1, neox_args.log_interval - total_loss_dict[skipped_iters_key])
 
         # log curriculum learning
         if neox_args.curriculum_learning:
@@ -317,9 +296,7 @@ def training_log(
         flops_per_s_per_gpu = get_flops(
             neox_args=neox_args, model=model, iter_time_s=iteration_time
         )
-        log_string += (
-            f" approx flops per GPU: {human_readable_flops(flops_per_s_per_gpu)} |"
-        )
+        log_string += f" approx flops per GPU: {human_readable_flops(flops_per_s_per_gpu)} |"
         tb_wandb_log(
             "runtime/flops_per_sec_per_gpu",
             flops_per_s_per_gpu,
@@ -343,9 +320,7 @@ def training_log(
         log_string += " number of skipped iterations: {:3d} |".format(
             total_loss_dict[skipped_iters_key]
         )
-        log_string += " number of nan iterations: {:3d} |".format(
-            total_loss_dict[got_nan_key]
-        )
+        log_string += " number of nan iterations: {:3d} |".format(total_loss_dict[got_nan_key])
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[got_nan_key] = 0
         print_rank_0(log_string)
@@ -355,7 +330,14 @@ def training_log(
 
         timers.log(timers_to_log, normalizer=neox_args.log_interval)
 
+    if torch.distributed.get_rank() == 0:
+        core_context.train.report_training_metrics(
+            steps_completed=iteration, metrics=DETERMINED_ACCUMULATED_LOGS
+        )
     return report_memory_flag
+
+
+DETERMINED_ACCUMULATED_LOGS = {}
 
 
 def tb_wandb_log(
@@ -366,6 +348,7 @@ def tb_wandb_log(
     tensorboard_writer=None,
     all_ranks: bool = False,
 ):
+    global DETERMINED_ACCUMULATED_LOGS
     # logs to both tb and wandb (if present) from the zeroth rank
     do_log = torch.distributed.get_rank() == 0 or all_ranks
     if do_log and value is not None:
@@ -373,3 +356,7 @@ def tb_wandb_log(
             tensorboard_writer.add_scalar(key, value, iteration_no)
         if use_wandb:
             wandb.log({key: value}, step=iteration_no)
+        # Determined report_training_metrics can't accept tensors.
+        if isinstance(value, torch.Tensor):
+            value = value.item()
+        DETERMINED_ACCUMULATED_LOGS[key] = value

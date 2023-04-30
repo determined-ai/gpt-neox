@@ -21,13 +21,14 @@
 """Pretrain utilities."""
 from datetime import datetime
 from functools import partial
-
+import logging
 import math
 import sys
 
 import torch
 import deepspeed
 from deepspeed.runtime.data_pipeline.curriculum_scheduler import CurriculumScheduler
+import determined as det
 import numpy as np
 
 from megatron.utils import (
@@ -47,7 +48,7 @@ from megatron.checkpointing import load_checkpoint, save_checkpoint
 from megatron.data.data_utils import build_train_valid_test_data_iterators
 from megatron.initialize import initialize_megatron
 from megatron.learning_rates import AnnealingLR
-from megatron.logging import tb_wandb_log, training_log
+from megatron.logging import DETERMINED_ACCUMULATED_LOGS, tb_wandb_log, training_log
 from megatron.utils import (
     OverflowMonitor,
     get_noise_scale_logger,
@@ -72,7 +73,6 @@ def mup_weights_reinit(neox_args, model):
 
 
 def save_base_shapes(neox_args, base_shapes, use_cache):
-
     # Instantiation of the base model fails in the init function (init_functions.py) because we haven't called set_base_shapes on it at this point, so disable it temporarily here
     neox_args.use_mup = False
 
@@ -124,7 +124,7 @@ def save_base_shapes(neox_args, base_shapes, use_cache):
     sys.exit(1)
 
 
-def mup_coord_check(neox_args, timers, lr_scheduler, train_data_iterator):
+def mup_coord_check(neox_args, timers, lr_scheduler, train_data_iterator, core_context):
     from megatron.mup_substitute import get_coord_data
     from mup.coord_check import plot_coord_data
 
@@ -134,7 +134,7 @@ def mup_coord_check(neox_args, timers, lr_scheduler, train_data_iterator):
             neox_args.hidden_size = hidden_size
 
             model, optimizer, _ = setup_model_and_optimizer(
-                neox_args=neox_args, use_cache=False
+                neox_args=neox_args, core_context=core_context, use_cache=False
             )
 
             neox_args.hidden_size = old_hidden_size
@@ -150,13 +150,9 @@ def mup_coord_check(neox_args, timers, lr_scheduler, train_data_iterator):
         models[hidden_size] = lazy_model(hidden_size)
 
     neox_args.use_mup = True
-    df_up = get_coord_data(
-        neox_args, timers, lr_scheduler, models, train_data_iterator, mup=True
-    )
+    df_up = get_coord_data(neox_args, timers, lr_scheduler, models, train_data_iterator, mup=True)
     neox_args.use_mup = False
-    df_sp = get_coord_data(
-        neox_args, timers, lr_scheduler, models, train_data_iterator, mup=False
-    )
+    df_sp = get_coord_data(neox_args, timers, lr_scheduler, models, train_data_iterator, mup=False)
 
     plot_coord_data(df_up, save_to=f"coord_check_up.{torch.distributed.get_rank()}.jpg")
     plot_coord_data(df_sp, save_to=f"coord_check_sp.{torch.distributed.get_rank()}.jpg")
@@ -165,7 +161,7 @@ def mup_coord_check(neox_args, timers, lr_scheduler, train_data_iterator):
     sys.exit(1)
 
 
-def pretrain(neox_args):
+def pretrain(neox_args, core_context):
     """Main training program.
 
     This function will run the following in the order provided:
@@ -180,17 +176,19 @@ def pretrain(neox_args):
     """
     # setup logging and timers
     init_wandb(neox_args=neox_args)
-    timers = Timers(
-        use_wandb=neox_args.use_wandb, tensorboard_writer=neox_args.tensorboard_writer
-    )
+    timers = Timers(use_wandb=neox_args.use_wandb, tensorboard_writer=neox_args.tensorboard_writer)
 
     # Initialize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(neox_args=neox_args)
 
     # Model, optimizer, and learning rate.
     timers("model and optimizer").start()
+    logging.info("Starting from iteration {}".format(neox_args.iteration))
     model, optimizer, lr_scheduler = setup_model_and_optimizer(
-        neox_args=neox_args, use_cache=False, iteration=neox_args.iteration
+        neox_args=neox_args,
+        core_context=core_context,
+        use_cache=False,
+        iteration=neox_args.iteration,
     )
     timers("model and optimizer").stop()
 
@@ -204,7 +202,7 @@ def pretrain(neox_args):
     timers("train/valid/test data iterators").stop()
 
     if neox_args.use_mup and neox_args.coord_check:
-        mup_coord_check(neox_args, timers, lr_scheduler, train_data_iterator)
+        mup_coord_check(neox_args, timers, lr_scheduler, train_data_iterator, core_context)
 
     # Print setup timing.
     print_rank_0("done with setups ...")
@@ -221,6 +219,7 @@ def pretrain(neox_args):
                 model=model,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
+                core_context=core_context,
             )
 
         iteration = train(
@@ -231,6 +230,7 @@ def pretrain(neox_args):
             lr_scheduler=lr_scheduler,
             train_data_iterator=train_data_iterator,
             valid_data_iterator=valid_data_iterator,
+            core_context=core_context,
         )
 
     if neox_args.do_valid:
@@ -244,6 +244,7 @@ def pretrain(neox_args):
             iteration=iteration,
             verbose=False,
             timers=timers,
+            core_context=core_context,
         )
 
     if neox_args.save and iteration != 0:
@@ -253,6 +254,7 @@ def pretrain(neox_args):
             model=model,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
+            core_context=core_context,
         )
 
     if neox_args.do_test:
@@ -268,6 +270,7 @@ def pretrain(neox_args):
             verbose=True,
             timers=timers,
             chart_name="test",
+            core_context=core_context,
         )
 
 
@@ -342,9 +345,7 @@ def get_batch_pipe(data, neox_args, curr_scheduler=None):
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
 
 
-def forward_step(
-    data_iterator, model, neox_args, timers, return_logits=False, is_train=False
-):
+def forward_step(data_iterator, model, neox_args, timers, return_logits=False, is_train=False):
     """Forward step."""
     if neox_args.is_pipe_parallel:
         return model.eval_batch(data_iterator, return_logits=return_logits)
@@ -367,9 +368,7 @@ def forward_step(
     ):
         loss_mask = loss_mask[:, : neox_args.curriculum_seqlen].contiguous()
         labels = labels[:, : neox_args.curriculum_seqlen].contiguous()
-    loss = cross_entropy(
-        outputs, (labels, loss_mask), _fp16=neox_args.fp16_lm_cross_entropy
-    )
+    loss = cross_entropy(outputs, (labels, loss_mask), _fp16=neox_args.fp16_lm_cross_entropy)
     if return_logits:
         return loss, outputs
     return loss
@@ -469,8 +468,7 @@ def get_optimizer(model, neox_args):
 
     # If we're using mup, then the optimizer must be adam or sgd
     assert not neox_args.use_mup or (
-        neox_args.optimizer_type.lower() == "adam"
-        or neox_args.optimizer_type.lower() == "sgd"
+        neox_args.optimizer_type.lower() == "adam" or neox_args.optimizer_type.lower() == "sgd"
     ), f"If use_mup == True, you must specify either the adam or sgd optimizers. You passed: {neox_args.optimizer_type.lower()}"
 
     if neox_args.optimizer_type.lower() in ["cpu_adam", "cpu_torch_adam"]:
@@ -528,9 +526,7 @@ def get_optimizer(model, neox_args):
                     from apex.optimizers import FusedAdam as Adam
                 except ImportError:
                     # if apex isn't installed, use deepspeed's FusedAdam
-                    print(
-                        "WARNING: APEX not installed - defaulting to deepspeed's fused adam"
-                    )
+                    print("WARNING: APEX not installed - defaulting to deepspeed's fused adam")
                     from deepspeed.ops.adam import FusedAdam as Adam
                 adam_optimizer = Adam
         optimizer = adam_optimizer(
@@ -595,7 +591,7 @@ def get_learning_rate_scheduler(optimizer, neox_args):
     return lr_scheduler
 
 
-def setup_model_and_optimizer(neox_args, use_cache=False, iteration=None):
+def setup_model_and_optimizer(neox_args, core_context, use_cache=False, iteration=None):
     """Setup model and optimizer."""
     model = get_model(neox_args=neox_args, use_cache=use_cache)
     optimizer, param_groups = get_optimizer(model=model, neox_args=neox_args)
@@ -633,24 +629,21 @@ def setup_model_and_optimizer(neox_args, use_cache=False, iteration=None):
             else:
                 curr_scheduler = None
             model.set_batch_fn(
-                partial(
-                    get_batch_pipe, neox_args=neox_args, curr_scheduler=curr_scheduler
-                )
+                partial(get_batch_pipe, neox_args=neox_args, curr_scheduler=curr_scheduler)
             )
     else:
         raise ValueError("Must be using deepspeed to run neox")
 
-    if neox_args.load is not None:
+    if neox_args.load is not None or det.get_cluster_info().latest_checkpoint is not None:
         neox_args.iteration = load_checkpoint(
             neox_args=neox_args,
             model=model,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             iteration=iteration,
+            core_context=core_context,
         )
-        print_rank_0(
-            f"Loading checkpoint and starting from iteration {neox_args.iteration}"
-        )
+        print_rank_0(f"Loading checkpoint and starting from iteration {neox_args.iteration}")
     else:
         neox_args.iteration = 0
 
@@ -754,6 +747,7 @@ def train(
     lr_scheduler,
     train_data_iterator,
     valid_data_iterator,
+    core_context,
 ):
     """Train the model function."""
 
@@ -774,90 +768,129 @@ def train(
 
     # to monitor if we've skipped many iterations in a row and trigger an early exit
     overflow_monitor = OverflowMonitor(optimizer)
-    while iteration < neox_args.train_iters:
-        loss_dict, skipped_iter = train_step(
-            neox_args=neox_args,
-            timers=timers,
-            data_iterator=train_data_iterator,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-        )
-        iteration += 1
-        neox_args.iteration = iteration
 
-        overflow_monitor.check(skipped_iter)  # check for repeated overflow
-        if neox_args.log_gradient_noise_scale:  # log noise scale if applicable
-            noise_scale_logger.update()
-
-        # get learning rate (if present) - if doing soft prompt tuning + pipe parallel, you
-        # may have no tunable parameters on a specific rank
-        if optimizer.param_groups:
-            lr = optimizer.param_groups[0].get("lr", 0)
-        else:
-            lr = 0
-
-        # Logging.
-        report_memory_flag = training_log(
-            neox_args=neox_args,
-            timers=timers,
-            loss_dict=loss_dict,
-            total_loss_dict=total_loss_dict,
-            learning_rate=lr,
-            iteration=iteration,
-            loss_scale=optimizer.cur_scale if neox_args.precision == "fp16" else None,
-            report_memory_flag=report_memory_flag,
-            skipped_iter=skipped_iter,
-            model=model,
-            optimizer=optimizer,
-            noise_scale_logger=noise_scale_logger,
-        )
-
-        # Checkpointing
-        if neox_args.save and iteration in neox_args.save_iters:
-            save_checkpoint(
+    # track this metric, so we can report to hparam searcher when completed.
+    searcher_metric = det.get_cluster_info().trial._config["searcher"]["metric"]
+    last_searcher_metric = None
+    for op in core_context.searcher.operations():
+        while iteration < op.length:
+            just_saved = False
+            loss_dict, skipped_iter = train_step(
                 neox_args=neox_args,
-                iteration=iteration,
+                timers=timers,
+                data_iterator=train_data_iterator,
                 model=model,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
             )
+            iteration += 1
+            neox_args.iteration = iteration
 
-        # Evaluation
-        if (
-            neox_args.eval_interval
-            and iteration % neox_args.eval_interval == 0
-            and neox_args.do_valid
-        ):
-            prefix = "iteration {}".format(iteration)
-            evaluate_and_print_results(
+            overflow_monitor.check(skipped_iter)  # check for repeated overflow
+            if neox_args.log_gradient_noise_scale:  # log noise scale if applicable
+                noise_scale_logger.update()
+
+            # get learning rate (if present) - if doing soft prompt tuning + pipe parallel, you
+            # may have no tunable parameters on a specific rank
+            if optimizer.param_groups:
+                lr = optimizer.param_groups[0].get("lr", 0)
+            else:
+                lr = 0
+
+            # Logging.
+            report_memory_flag = training_log(
                 neox_args=neox_args,
-                prefix=prefix,
-                forward_step_func=forward_step,
-                data_iterator=valid_data_iterator,
-                model=model,
-                iteration=iteration,
-                verbose=False,
                 timers=timers,
+                loss_dict=loss_dict,
+                total_loss_dict=total_loss_dict,
+                learning_rate=lr,
+                iteration=iteration,
+                loss_scale=optimizer.cur_scale if neox_args.precision == "fp16" else None,
+                report_memory_flag=report_memory_flag,
+                skipped_iter=skipped_iter,
+                model=model,
+                optimizer=optimizer,
+                noise_scale_logger=noise_scale_logger,
+                core_context=core_context,
             )
+            if searcher_metric in DETERMINED_ACCUMULATED_LOGS:
+                last_searcher_metric = DETERMINED_ACCUMULATED_LOGS[searcher_metric]
 
-        if neox_args.exit_interval and iteration % neox_args.exit_interval == 0:
-            torch.distributed.barrier()
-            time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            rank = torch.distributed.get_rank()
-            print_rank_0(
-                "rank: {} | time: {} | exiting the program at iteration {}".format(
-                    rank, time_str, iteration
+            # Checkpointing
+            if neox_args.save and iteration in neox_args.save_iters:
+                save_checkpoint(
+                    neox_args=neox_args,
+                    iteration=iteration,
+                    model=model,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    core_context=core_context,
                 )
-            )
-            sys.exit()
+                just_saved = True
 
+            # Evaluation
+            if (
+                neox_args.eval_interval
+                and iteration % neox_args.eval_interval == 0
+                and neox_args.do_valid
+            ):
+                prefix = "iteration {}".format(iteration)
+                evaluate_and_print_results(
+                    neox_args=neox_args,
+                    prefix=prefix,
+                    forward_step_func=forward_step,
+                    data_iterator=valid_data_iterator,
+                    model=model,
+                    iteration=iteration,
+                    verbose=False,
+                    timers=timers,
+                )
+            if searcher_metric in DETERMINED_ACCUMULATED_LOGS:
+                last_searcher_metric = DETERMINED_ACCUMULATED_LOGS[searcher_metric]
+            if torch.distributed.get_rank() == 0:
+                op.report_progress(iteration)
+
+            if neox_args.exit_interval and iteration % neox_args.exit_interval == 0:
+                torch.distributed.barrier()
+                time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rank = torch.distributed.get_rank()
+                print_rank_0(
+                    "rank: {} | time: {} | exiting the program at iteration {}".format(
+                        rank, time_str, iteration
+                    )
+                )
+                sys.exit()
+
+            # TODO: Make preemption interval configurable?
+            # We don't do this every iteration, because the docs advice that it's blocking and not performant.
+            PREEMPT_INTERVAL = 100
+            if iteration % PREEMPT_INTERVAL == 0 and core_context.preempt.should_preempt():
+                if not (just_saved):
+                    save_checkpoint(
+                        neox_args=neox_args,
+                        iteration=iteration,
+                        model=model,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
+                        core_context=core_context,
+                    )
+                    just_saved = True
+                torch.distributed.barrier()
+                time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rank = torch.distributed.get_rank()
+                print_rank_0(
+                    "rank: {} | time: {} | exiting the program due to preemption at iteration {}".format(
+                        rank, time_str, iteration
+                    )
+                )
+                sys.exit()
+
+        if torch.distributed.get_rank() == 0:
+            op.report_completed(last_searcher_metric)
     return iteration
 
 
-def evaluate(
-    neox_args, forward_step_fn, data_iterator, model, verbose=False, timers=None
-):
+def evaluate(neox_args, forward_step_fn, data_iterator, model, verbose=False, timers=None):
     """Evaluation.
     neox_args: NeoX Arguments
     forward_step_fn: function with args `neox_args, timers,
@@ -878,17 +911,13 @@ def evaluate(
         while iteration < neox_args.eval_iters:
             iteration += 1
             if verbose and iteration % neox_args.log_interval == 0:
-                print_rank_0(
-                    "Evaluating iter {}/{}".format(iteration, neox_args.eval_iters)
-                )
+                print_rank_0("Evaluating iter {}/{}".format(iteration, neox_args.eval_iters))
 
             # although we're not accumulating gradients here, we count one iter as train_batch_size_per_gpu * g.a.s
             # to be consistent with deepspeed's pipe parallel engine
             # since pipe parallel already takes gas into account - default to 1 here if pipe parallel is true
             for _ in range(
-                1
-                if neox_args.is_pipe_parallel
-                else neox_args.gradient_accumulation_steps
+                1 if neox_args.is_pipe_parallel else neox_args.gradient_accumulation_steps
             ):
                 # Forward evaluation
                 loss = forward_step_fn(
@@ -918,9 +947,7 @@ def evaluate(
         print_rank_0(f"Counting chars took {data_iterator.total_time} seconds")
 
         data_iterator = data_iterator.data_iterator
-        eval_results["lm_loss_char_lvl_ppl"] = math.exp(
-            eval_results["lm_loss"] * tokens_per_char
-        )
+        eval_results["lm_loss_char_lvl_ppl"] = math.exp(eval_results["lm_loss"] * tokens_per_char)
 
     if neox_args.eval_tasks:
         eval_results.update(
@@ -940,11 +967,13 @@ def evaluate_and_print_results(
     data_iterator,
     model,
     iteration,
+    core_context,
     verbose=False,
     timers=None,
     chart_name="validation",
 ):
     """Helper function to evaluate and dump results on screen."""
+    DETERMINED_ACCUMULATED_LOGS.clear()
     total_loss_dict = evaluate(
         neox_args=neox_args,
         forward_step_fn=forward_step_func,
@@ -975,6 +1004,12 @@ def evaluate_and_print_results(
                 use_wandb=neox_args.use_wandb,
                 tensorboard_writer=neox_args.tensorboard_writer,
             )
+    if torch.distributed.get_rank() == 0 and chart_name == "validation":
+        # NOTE: We currently report only validation, not test, since otherwise we get a
+        # duplicate key entry from report_validation_metrics.
+        core_context.train.report_validation_metrics(
+            steps_completed=iteration, metrics=DETERMINED_ACCUMULATED_LOGS
+        )
 
     length = len(string) + 1
     print_rank_0("-" * length)

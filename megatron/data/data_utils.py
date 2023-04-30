@@ -108,9 +108,7 @@ def build_train_valid_test_datasets(
         print_rank_0("    {}:".format(name))
         print_rank_0(
             "     document indices in [{}, {}) total of {} "
-            "documents".format(
-                splits[index], splits[index + 1], splits[index + 1] - splits[index]
-            )
+            "documents".format(splits[index], splits[index + 1], splits[index + 1] - splits[index])
         )
 
     print_split_stats("train", 0)
@@ -296,9 +294,7 @@ def build_train_valid_test_data_iterators(neox_args):
     # Ensure only the first/last pipeline stages have data loaders
     if neox_args.is_pipe_parallel:
         is_first_stage = mpu.get_pipe_parallel_rank() == 0
-        is_last_stage = (
-            mpu.get_pipe_parallel_rank() == mpu.get_pipe_parallel_world_size() - 1
-        )
+        is_last_stage = mpu.get_pipe_parallel_rank() == mpu.get_pipe_parallel_world_size() - 1
         pipe_load = is_first_stage or is_last_stage
     else:
         pipe_load = True
@@ -341,7 +337,6 @@ def build_train_valid_test_data_iterators(neox_args):
             )
 
             if neox_args.weight_by_num_documents:
-
                 # gets the number of documents in each datapath
                 get_num_docs_list = lambda datasets: [
                     dataset.indexed_dataset.sizes.shape[0] for dataset in datasets
@@ -353,9 +348,7 @@ def build_train_valid_test_data_iterators(neox_args):
                 )
 
                 # builds weights according to alpha + the number of docs
-                fn = partial(
-                    weights_by_num_docs, alpha=neox_args.weighted_sampler_alpha
-                )
+                fn = partial(weights_by_num_docs, alpha=neox_args.weighted_sampler_alpha)
                 train_weights, valid_weights, test_weights = (
                     fn(train_num_docs),
                     fn(valid_num_docs),
@@ -387,7 +380,6 @@ def build_train_valid_test_data_iterators(neox_args):
                     valid_weights,
                     test_weights,
                 )
-
             if train_datasets:
                 train_ds = BlendableDataset(train_datasets, train_weights)
             if valid_datasets:
@@ -449,12 +441,9 @@ def build_train_valid_test_data_iterators(neox_args):
         )
     if valid_dataloader is not None:
         start_iter_val = (
-            (neox_args.iteration * neox_args.gradient_accumulation_steps)
-            // neox_args.eval_interval
+            (neox_args.iteration * neox_args.gradient_accumulation_steps) // neox_args.eval_interval
         ) * neox_args.eval_iters
-        valid_dataloader.batch_sampler.start_iter = start_iter_val % len(
-            valid_dataloader
-        )
+        valid_dataloader.batch_sampler.start_iter = start_iter_val % len(valid_dataloader)
         print_rank_0(
             "setting validation data start iteration to {}".format(
                 valid_dataloader.batch_sampler.start_iter
